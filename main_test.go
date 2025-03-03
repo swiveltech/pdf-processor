@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-lambda-go/events"
-	"github.com/your-org/pdf-processor/processor"
+	"github.com/swiveltech/pdf-processor/processor"
 )
 
 func TestLocalPDFProcessing(t *testing.T) {

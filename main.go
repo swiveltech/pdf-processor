@@ -2,7 +2,7 @@ package main
 
 import (
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/your-org/pdf-processor/processor"
+	"github.com/swiveltech/pdf-processor/processor"
 )
 
 func main() {

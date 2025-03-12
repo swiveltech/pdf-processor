@@ -18,6 +18,7 @@ import (
 	"sort"
 	"time"
 
+	
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -57,9 +58,12 @@ func getS3Client() (*s3.Client, error) {
 		return nil, nil
 	}
 	
-	cfg, err := config.LoadDefaultConfig(context.TODO())
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithRetryMaxAttempts(3),
+		config.WithRetryMode(aws.RetryModeStandard),
+	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to load AWS config: %v", err)
 	}
 	return s3.NewFromConfig(cfg), nil
 }
@@ -233,9 +237,9 @@ func makeWebhookRequest(method, url string, payload io.Reader) (*http.Response, 
 }
 
 func callRubyEndpoint(data BarcodeData) error {
-	apiEndpoint := os.Getenv("API_ENDPOINT")
-	if apiEndpoint == "" {
-		return fmt.Errorf("API_ENDPOINT environment variable not set")
+	url := getWebhookURL()
+	if url == "" {
+		return fmt.Errorf("WEBHOOK_URL environment variable not set")
 	}
 
 	jsonData, err := json.Marshal(data)
@@ -243,27 +247,22 @@ func callRubyEndpoint(data BarcodeData) error {
 		return fmt.Errorf("error marshaling JSON: %v", err)
 	}
 
-	req, err := http.NewRequest("POST", apiEndpoint, bytes.NewBuffer(jsonData))
+	res, err := makeWebhookRequest("POST", url, bytes.NewReader(jsonData))
 	if err != nil {
-		return fmt.Errorf("error creating request: %v", err)
+		return fmt.Errorf("error making webhook request: %v", err)
 	}
+	defer res.Body.Close()
 
-	req.Header.Set("Content-Type", "application/json")
-	
-	// Create HTTP client with timeout
-	client := &http.Client{Timeout: 10 * time.Second}
-	
-	resp, err := client.Do(req)
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return fmt.Errorf("error making request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("API returned non-200 status: %d", resp.StatusCode)
+		return fmt.Errorf("error reading response body: %v", err)
 	}
 
-	log.Printf("Successfully sent barcode data to API: %v", data.BarcodeArray)
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("webhook returned non-200 status: %d, body: %s", res.StatusCode, string(body))
+	}
+
+	log.Printf("Successfully sent barcode data to webhook: %v", data.BarcodeArray)
 	return nil
 }
 
@@ -295,32 +294,73 @@ func HandleRequest(ctx context.Context, s3Event events.S3Event) (Response, error
 		bucket = "test-bucket"
 	} else {
 		// Get the S3 bucket and key
+		if len(s3Event.Records) == 0 {
+			return Response{StatusCode: 400, Body: "No S3 event records"}, fmt.Errorf("no S3 event records")
+		}
+		
 		record := s3Event.Records[0]
 		bucket = record.S3.Bucket.Name
 		key = record.S3.Object.Key
 
+		// Validate bucket and key
+		if bucket == "" || key == "" {
+			return Response{StatusCode: 400, Body: "Invalid S3 event: missing bucket or key"}, 
+                   fmt.Errorf("invalid S3 event: bucket=%q, key=%q", bucket, key)
+		}
+
+		// Log the attempt
+		log.Printf("Attempting to get object from S3 - Bucket: %s, Key: %s", bucket, key)
+
 		// Initialize S3 client
 		s3Client, err := getS3Client()
 		if err != nil {
-			return Response{StatusCode: 500, Body: "Error initializing S3 client"}, err
+			return Response{StatusCode: 500, Body: fmt.Sprintf("Failed to initialize S3 client: %v", err)}, err
 		}
 
-		// Get the PDF from S3
-		result, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
+		// Get the PDF directly from S3
+		input := &s3.GetObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String(key),
-		})
+		}
+		
+		result, err := s3Client.GetObject(ctx, input)
 		if err != nil {
-			return Response{StatusCode: 500, Body: "Error getting object from S3"}, err
+			// Log detailed error for debugging
+			log.Printf("S3 GetObject error - Bucket: %s, Key: %s, Error: %v", bucket, key, err)
+			return Response{
+				StatusCode: 500,
+				Body: fmt.Sprintf("Failed to get object from S3 (bucket: %s, key: %s): %v", 
+                       bucket, key, err),
+			}, err
 		}
 		defer result.Body.Close()
 
-		// Read PDF into memory
-		var buf bytes.Buffer
-		if _, err := buf.ReadFrom(result.Body); err != nil {
-			return Response{StatusCode: 500, Body: "Error reading PDF"}, err
+		// Create a buffer with reasonable size
+		buf := bytes.NewBuffer(make([]byte, 0, 1024*1024)) // 1MB initial capacity
+		
+		// Copy with timeout
+		done := make(chan error, 1)
+		go func() {
+			_, err := io.Copy(buf, result.Body)
+			done <- err
+		}()
+
+		select {
+		case <-time.After(30 * time.Second):
+			return Response{StatusCode: 500, Body: "Timeout reading PDF from S3"}, fmt.Errorf("timeout reading PDF")
+		case err := <-done:
+			if err != nil {
+				return Response{StatusCode: 500, Body: "Error reading PDF from S3"}, err
+			}
 		}
+		
 		pdfBytes = buf.Bytes()
+		
+		// Validate PDF size
+		if len(pdfBytes) == 0 {
+			return Response{StatusCode: 400, Body: "Empty PDF file from S3"}, 
+                   fmt.Errorf("empty PDF file from S3: bucket=%s, key=%s", bucket, key)
+		}
 	}
 
 	log.Printf("Read PDF file: %s (size: %d bytes)", key, len(pdfBytes))
@@ -469,32 +509,44 @@ func HandleRequest(ctx context.Context, s3Event events.S3Event) (Response, error
 		}
 	}
 
-	// If we found any barcodes, send them to the webhook and return response
+	// Process all found barcodes
 	if len(foundBarcodes) > 0 {
-		responseBody := ResponseBody{
+		// Send all found barcodes in a single webhook call
+		data := BarcodeData{
+			S3Key:        key,
+			BarcodeArray: foundBarcodes,
+		}
+		if err := callRubyEndpoint(data); err != nil {
+			log.Printf("Error sending barcode data to API: %v", err)
+		}
+
+		// Return success response with found barcodes
+		jsonBody, _ := json.Marshal(ResponseBody{
 			Bucket:   bucket,
 			Key:      key,
 			Barcodes: foundBarcodes,
-		}
-		
-		jsonBody, _ := json.Marshal(responseBody)
+		})
 		return Response{
 			StatusCode: 200,
 			Body:       string(jsonBody),
 		}, nil
 	}
 
-	// Log total barcodes found
-	log.Printf("Total barcodes found: %d", len(foundBarcodes))
+	// Call webhook with empty barcode array if no barcodes found
+	data := BarcodeData{
+		S3Key:        key,
+		BarcodeArray: []string{},
+	}
+	if err := callRubyEndpoint(data); err != nil {
+		log.Printf("Error sending empty barcode data to API: %v", err)
+	}
 
-	// Return response with empty barcodes array if none found
-	responseBody := ResponseBody{
+	// Return success response with empty barcode array
+	jsonBody, _ := json.Marshal(ResponseBody{
 		Bucket:   bucket,
 		Key:      key,
 		Barcodes: []string{},
-	}
-	
-	jsonBody, _ := json.Marshal(responseBody)
+	})
 	return Response{
 		StatusCode: 200,
 		Body:       string(jsonBody),

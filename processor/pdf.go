@@ -18,7 +18,6 @@ import (
 	"sort"
 	"time"
 
-	
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -43,6 +42,14 @@ type ResponseBody struct {
 type BarcodeData struct {
 	S3Key        string   `json:"s3_key"`
 	BarcodeArray []string `json:"barcode_array"`
+}
+
+type SQSMessageBody struct {
+	S3Key            string `json:"s3_key"`
+	FileName         string `json:"file_name"`
+	BucketName       string `json:"bucket_name"`
+	BarcodeScanLogID int    `json:"barcode_scan_log_id"`
+	OrganisationID   int    `json:"organisation_id"`
 }
 
 func getFileSize(path string) int64 {
@@ -266,7 +273,27 @@ func callRubyEndpoint(data BarcodeData) error {
 	return nil
 }
 
-func HandleRequest(ctx context.Context, s3Event events.S3Event) (Response, error) {
+func HandleRequest(ctx context.Context, sqsEvent events.SQSEvent) (Response, error) {
+	// Validate SQS event
+	if len(sqsEvent.Records) == 0 {
+		return Response{StatusCode: 400, Body: "No SQS event records"}, fmt.Errorf("no SQS event records")
+	}
+
+	// Process first record (we handle one message at a time)
+	record := sqsEvent.Records[0]
+	
+	// Parse message body
+	var messageBody SQSMessageBody
+	if err := json.Unmarshal([]byte(record.Body), &messageBody); err != nil {
+		return Response{StatusCode: 400, Body: "Invalid message format"}, fmt.Errorf("failed to parse message: %v", err)
+	}
+
+	// Validate required fields
+	if messageBody.S3Key == "" || messageBody.BucketName == "" {
+		return Response{StatusCode: 400, Body: "Missing s3_key or bucket_name in message"}, 
+            fmt.Errorf("missing required fields: s3_key=%q, bucket_name=%q", messageBody.S3Key, messageBody.BucketName)
+	}
+
 	// Create debug directory if in test mode
 	if os.Getenv("TEST_DEBUG") == "true" {
 		os.MkdirAll("debug-images", 0755)
@@ -282,7 +309,8 @@ func HandleRequest(ctx context.Context, s3Event events.S3Event) (Response, error
 
 	var pdfBytes []byte
 	var err error
-	var bucket, key string
+	key := messageBody.S3Key
+	bucket := messageBody.BucketName
 
 	if testPath := os.Getenv("TEST_PDF_PATH"); testPath != "" {
 		// Local testing mode - read file directly
@@ -293,24 +321,6 @@ func HandleRequest(ctx context.Context, s3Event events.S3Event) (Response, error
 		key = testPath
 		bucket = "test-bucket"
 	} else {
-		// Get the S3 bucket and key
-		if len(s3Event.Records) == 0 {
-			return Response{StatusCode: 400, Body: "No S3 event records"}, fmt.Errorf("no S3 event records")
-		}
-		
-		record := s3Event.Records[0]
-		bucket = record.S3.Bucket.Name
-		key = record.S3.Object.Key
-
-		// Validate bucket and key
-		if bucket == "" || key == "" {
-			return Response{StatusCode: 400, Body: "Invalid S3 event: missing bucket or key"}, 
-                   fmt.Errorf("invalid S3 event: bucket=%q, key=%q", bucket, key)
-		}
-
-		// Log the attempt
-		log.Printf("Attempting to get object from S3 - Bucket: %s, Key: %s", bucket, key)
-
 		// Initialize S3 client
 		s3Client, err := getS3Client()
 		if err != nil {

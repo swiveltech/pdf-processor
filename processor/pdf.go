@@ -13,8 +13,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"sort"
 	"time"
 
@@ -40,16 +38,18 @@ type ResponseBody struct {
 }
 
 type BarcodeData struct {
-	S3Key        string   `json:"s3_key"`
-	BarcodeArray []string `json:"barcode_array"`
+	BarcodeScanLogID int      `json:"barcode_scan_log_id"`
+	BarcodeArray     []string `json:"barcode_array,omitempty"`
+	ErrorInfo        string   `json:"error_info,omitempty"`
+	Status           string   `json:"status,omitempty"`
 }
 
 type SQSMessageBody struct {
 	S3Key            string `json:"s3_key"`
 	FileName         string `json:"file_name"`
 	BucketName       string `json:"bucket_name"`
+	Region           string `json:"region"`
 	BarcodeScanLogID int    `json:"barcode_scan_log_id"`
-	OrganisationID   int    `json:"organisation_id"`
 }
 
 func getFileSize(path string) int64 {
@@ -60,14 +60,19 @@ func getFileSize(path string) int64 {
 	return info.Size()
 }
 
-func getS3Client() (*s3.Client, error) {
+func getS3Client(region string) (*s3.Client, error) {
 	if os.Getenv("TEST_PDF_PATH") != "" {
 		return nil, nil
+	}
+	
+	if region == "" {
+		region = "us-east-1"  // Fallback default region
 	}
 	
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
 		config.WithRetryMaxAttempts(3),
 		config.WithRetryMode(aws.RetryModeStandard),
+		config.WithRegion(region),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %v", err)
@@ -97,16 +102,16 @@ func preprocessImage(img image.Image) image.Image {
 		}
 	}
 
-	log.Printf("Image preprocessing - Min value: %d, Max value: %d, Contrast: %d", min, max, max-min)
+	log.Printf("[ID:%d] Image preprocessing - Min value: %d, Max value: %d, Contrast: %d", 0, min, max, max-min)
 
 	// Always apply contrast enhancement for small images that might contain barcodes
 	if bounds.Dx() < 100 || bounds.Dy() < 100 {
-		log.Printf("Small image detected (%dx%d), applying aggressive contrast enhancement", bounds.Dx(), bounds.Dy())
+		log.Printf("[ID:%d] Small image detected (%dx%d), applying aggressive contrast enhancement", 0, bounds.Dx(), bounds.Dy())
 		min = 0 // Force full range contrast
 		max = 255
-		log.Printf("Forcing full contrast range: min=%d, max=%d", min, max)
+		log.Printf("[ID:%d] Forcing full contrast range: min=%d, max=%d", 0, min, max)
 	} else if max-min < 30 {
-		log.Printf("Not enough contrast, using original grayscale")
+		log.Printf("[ID:%d] Not enough contrast, using original grayscale", 0)
 		return gray
 	}
 
@@ -133,7 +138,7 @@ func preprocessImage(img image.Image) image.Image {
 func extractBarcodeFromImage(img image.Image) (string, error) {
 	// Log image dimensions for debugging
 	bounds := img.Bounds()
-	log.Printf("Processing image with dimensions: %dx%d", bounds.Dx(), bounds.Dy())
+	log.Printf("[ID:%d] Processing image with dimensions: %dx%d", 0, bounds.Dx(), bounds.Dy())
 
 	// Preprocess image
 	processedImg := preprocessImage(img)
@@ -169,11 +174,11 @@ func extractBarcodeFromImage(img image.Image) (string, error) {
 		result, err := r.reader.Decode(bmp, hints)
 		if err == nil {
 			format := result.GetBarcodeFormat().String()
-			log.Printf("Found %s barcode using %s reader: %s", format, r.name, result.GetText())
+			log.Printf("[ID:%d] Found %s barcode using %s reader: %s", 0, format, r.name, result.GetText())
 			return result.GetText(), nil
 		}
 		lastErr = err
-		log.Printf("Attempt with %s reader failed: %v", r.name, err)
+		log.Printf("[ID:%d] Attempt with %s reader failed: %v", 0, r.name, err)
 	}
 
 	return "", fmt.Errorf("no barcode found with any reader, last error: %v", lastErr)
@@ -182,7 +187,7 @@ func extractBarcodeFromImage(img image.Image) (string, error) {
 func getWebhookURL() string {
 	url := os.Getenv("WEBHOOK_URL")
 	if url == "" {
-		log.Printf("Warning: WEBHOOK_URL not set")
+		log.Printf("[ID:%d] Warning: WEBHOOK_URL not set", 0)
 	}
 	return url
 }
@@ -230,8 +235,8 @@ func makeWebhookRequest(method, url string, payload io.Reader) (*http.Response, 
 
 	// Debug logging if enabled
 	if os.Getenv("DEBUG") == "true" {
-		log.Printf("Making request to: %s\n", url)
-		log.Printf("Headers: %v\n", req.Header)
+		log.Printf("[ID:%d] Making request to: %s\n", 0, url)
+		log.Printf("[ID:%d] Headers: %v\n", 0, req.Header)
 	}
 
 	// Make the request
@@ -269,7 +274,7 @@ func callRubyEndpoint(data BarcodeData) error {
 		return fmt.Errorf("webhook returned non-200 status: %d, body: %s", res.StatusCode, string(body))
 	}
 
-	log.Printf("Successfully sent barcode data to webhook: %v", data.BarcodeArray)
+	log.Printf("[ID:%d] Successfully sent barcode data to webhook: %v", data.BarcodeScanLogID, data.BarcodeArray)
 	return nil
 }
 
@@ -281,30 +286,22 @@ func HandleRequest(ctx context.Context, sqsEvent events.SQSEvent) (Response, err
 
 	// Process first record (we handle one message at a time)
 	record := sqsEvent.Records[0]
-	
+    
 	// Parse message body
 	var messageBody SQSMessageBody
 	if err := json.Unmarshal([]byte(record.Body), &messageBody); err != nil {
 		return Response{StatusCode: 400, Body: "Invalid message format"}, fmt.Errorf("failed to parse message: %v", err)
 	}
 
+	startTime := time.Now()
+	log.Printf("[ID:%d] Started processing PDF file: %s", messageBody.BarcodeScanLogID, messageBody.FileName)
+
 	// Validate required fields
 	if messageBody.S3Key == "" || messageBody.BucketName == "" {
+		log.Printf("[ID:%d] Missing required fields: s3_key=%q, bucket_name=%q", 
+			messageBody.BarcodeScanLogID, messageBody.S3Key, messageBody.BucketName)
 		return Response{StatusCode: 400, Body: "Missing s3_key or bucket_name in message"}, 
-            fmt.Errorf("missing required fields: s3_key=%q, bucket_name=%q", messageBody.S3Key, messageBody.BucketName)
-	}
-
-	// Create debug directory if in test mode
-	if os.Getenv("TEST_DEBUG") == "true" {
-		os.MkdirAll("debug-images", 0755)
-	}
-	// Get page limit from environment variable, default to processing first page only if not set
-	pageLimit := 1 // Default to scanning only first page
-	if limitStr := os.Getenv("PDF_PAGE_LIMIT"); limitStr != "" {
-		limit, err := strconv.Atoi(limitStr)
-		if err == nil && limit > 0 {
-			pageLimit = limit
-		}
+			fmt.Errorf("missing required fields")
 	}
 
 	var pdfBytes []byte
@@ -316,17 +313,21 @@ func HandleRequest(ctx context.Context, sqsEvent events.SQSEvent) (Response, err
 		// Local testing mode - read file directly
 		pdfBytes, err = os.ReadFile(testPath)
 		if err != nil {
+			log.Printf("[ID:%d] Error reading test PDF: %v", messageBody.BarcodeScanLogID, err)
 			return Response{StatusCode: 500, Body: "Error reading test PDF"}, err
 		}
 		key = testPath
 		bucket = "test-bucket"
 	} else {
-		// Initialize S3 client
-		s3Client, err := getS3Client()
+		// Initialize S3 client with region from SQS message
+		s3Client, err := getS3Client(messageBody.Region)
 		if err != nil {
+			log.Printf("[ID:%d] Failed to initialize S3 client: %v", messageBody.BarcodeScanLogID, err)
 			return Response{StatusCode: 500, Body: fmt.Sprintf("Failed to initialize S3 client: %v", err)}, err
 		}
 
+		log.Printf("[ID:%d] Downloading PDF from S3: bucket=%s, key=%s", messageBody.BarcodeScanLogID, bucket, key)
+		
 		// Get the PDF directly from S3
 		input := &s3.GetObjectInput{
 			Bucket: aws.String(bucket),
@@ -335,13 +336,8 @@ func HandleRequest(ctx context.Context, sqsEvent events.SQSEvent) (Response, err
 		
 		result, err := s3Client.GetObject(ctx, input)
 		if err != nil {
-			// Log detailed error for debugging
-			log.Printf("S3 GetObject error - Bucket: %s, Key: %s, Error: %v", bucket, key, err)
-			return Response{
-				StatusCode: 500,
-				Body: fmt.Sprintf("Failed to get object from S3 (bucket: %s, key: %s): %v", 
-                       bucket, key, err),
-			}, err
+			log.Printf("[ID:%d] Failed to download PDF: %v", messageBody.BarcodeScanLogID, err)
+			return Response{StatusCode: 500, Body: "Failed to get object from S3"}, err
 		}
 		defer result.Body.Close()
 
@@ -357,37 +353,23 @@ func HandleRequest(ctx context.Context, sqsEvent events.SQSEvent) (Response, err
 
 		select {
 		case <-time.After(30 * time.Second):
+			log.Printf("[ID:%d] Timeout downloading PDF", messageBody.BarcodeScanLogID)
 			return Response{StatusCode: 500, Body: "Timeout reading PDF from S3"}, fmt.Errorf("timeout reading PDF")
 		case err := <-done:
 			if err != nil {
+				log.Printf("[ID:%d] Error downloading PDF: %v", messageBody.BarcodeScanLogID, err)
 				return Response{StatusCode: 500, Body: "Error reading PDF from S3"}, err
 			}
 		}
 		
 		pdfBytes = buf.Bytes()
-		
-		// Validate PDF size
-		if len(pdfBytes) == 0 {
-			return Response{StatusCode: 400, Body: "Empty PDF file from S3"}, 
-                   fmt.Errorf("empty PDF file from S3: bucket=%s, key=%s", bucket, key)
-		}
-	}
-
-	log.Printf("Read PDF file: %s (size: %d bytes)", key, len(pdfBytes))
-	
-	// Validate PDF contents
-	if len(pdfBytes) == 0 {
-		return Response{StatusCode: 400, Body: "Empty PDF file"}, fmt.Errorf("empty PDF file")
+		log.Printf("[ID:%d] Successfully downloaded PDF (size: %d bytes)", messageBody.BarcodeScanLogID, len(pdfBytes))
 	}
 	
-	// Check if it's a valid PDF (starts with %PDF)
-	if len(pdfBytes) < 4 || string(pdfBytes[0:4]) != "%PDF" {
-		return Response{StatusCode: 400, Body: "Invalid PDF format"}, fmt.Errorf("invalid PDF format")
-	}
-
 	// Create a temporary directory for extracted images
 	tmpDir, err := os.MkdirTemp("", "pdf-images-*")
 	if err != nil {
+		log.Printf("[ID:%d] Error creating temp directory: %v", messageBody.BarcodeScanLogID, err)
 		return Response{StatusCode: 500, Body: "Error creating temp directory"}, err
 	}
 	defer os.RemoveAll(tmpDir)
@@ -395,167 +377,98 @@ func HandleRequest(ctx context.Context, sqsEvent events.SQSEvent) (Response, err
 	// Write PDF to temporary file
 	tmpPDF := filepath.Join(tmpDir, "input.pdf")
 	if err := os.WriteFile(tmpPDF, pdfBytes, 0644); err != nil {
+		log.Printf("[ID:%d] Error writing temporary PDF: %v", messageBody.BarcodeScanLogID, err)
 		return Response{StatusCode: 500, Body: "Error writing temporary PDF"}, err
 	}
 
-	// Get page limit from environment variable
-	pageRange := os.Getenv("PDF_PAGE_LIMIT")
-	if pageRange == "" {
-		pageRange = "1" // Default to 1 page
+	// Send processing status callback
+	processingData := BarcodeData{
+		BarcodeScanLogID: messageBody.BarcodeScanLogID,
+		Status:           "processing",
+	}
+	if err := callRubyEndpoint(processingData); err != nil {
+		log.Printf("[ID:%d] Error sending processing status: %v", messageBody.BarcodeScanLogID, err)
+		// Continue processing even if callback fails
+	} else {
+		log.Printf("[ID:%d] Successfully sent processing status", messageBody.BarcodeScanLogID)
 	}
 
 	// Configure PDF processing
 	config := model.NewDefaultConfiguration()
-	// Set validation mode to relaxed
 	config.ValidationMode = model.ValidationRelaxed
 
-	// Create a directory for processed pages
-	tmpPagesDir := filepath.Join(tmpDir, "pages")
-	if err := os.MkdirAll(tmpPagesDir, 0755); err != nil {
-		return Response{StatusCode: 500, Body: "Error creating pages directory"}, err
-	}
-
-	// Convert page limit to integer for splitting
-	pageLimit, err = strconv.Atoi(pageRange)
-	if err != nil {
-		log.Printf("Invalid page limit %s, defaulting to 1", pageRange)
-		pageLimit = 1
-	}
-
 	// Extract images from the PDF
-	log.Printf("Extracting images from PDF %s to %s", tmpPDF, tmpDir)
+	log.Printf("[ID:%d] Extracting images from PDF", messageBody.BarcodeScanLogID)
 	if err := api.ExtractImagesFile(tmpPDF, tmpDir, nil, config); err != nil {
-		log.Printf("Error extracting images from PDF: %v", err)
+		log.Printf("[ID:%d] Error extracting images: %v", messageBody.BarcodeScanLogID, err)
 		return Response{StatusCode: 500, Body: "Error extracting images from PDF"}, err
 	}
 
-	// Save extracted images to debug directory if in test mode
-	if os.Getenv("TEST_DEBUG") == "true" {
-		debugDir := "/tmp/pdf-debug"
-		files, err := os.ReadDir(tmpDir)
-		if err == nil {
-			for _, file := range files {
-				if !file.IsDir() && filepath.Ext(file.Name()) != ".pdf" {
-					src := filepath.Join(tmpDir, file.Name())
-					dst := filepath.Join(debugDir, file.Name())
-					input, err := os.ReadFile(src)
-					if err == nil {
-						os.WriteFile(dst, input, 0644)
-					}
-				}
-			}
-		}
-	}
-	
-	// List extracted files
-	extractedFiles, err := os.ReadDir(tmpDir)
-	if err != nil {
-		log.Printf("Error reading temp dir: %v", err)
-	} else {
-		log.Printf("Extracted files in %s:", tmpDir)
-		for _, f := range extractedFiles {
-			log.Printf("  - %s (size: %d bytes)", f.Name(), getFileSize(filepath.Join(tmpDir, f.Name())))
-		}
-	}
-
-	// Read extracted images from temp directory and only process up to pageLimit
+	// Process extracted images
 	files, err := os.ReadDir(tmpDir)
 	if err != nil {
+		log.Printf("[ID:%d] Error reading extracted images: %v", messageBody.BarcodeScanLogID, err)
 		return Response{StatusCode: 500, Body: "Error reading extracted images"}, err
 	}
 
 	// Get all image files from pages within the limit
-	sortedFiles := make([]string, 0)
+	var processFiles []string
 	for _, file := range files {
 		if !file.IsDir() && filepath.Ext(file.Name()) != ".pdf" {
-			// Check if image is from a page within our limit
-			parts := strings.Split(file.Name(), "_")
-			if len(parts) >= 2 {
-				pageNum, err := strconv.Atoi(parts[1])
-				if err == nil && pageNum <= pageLimit {
-					sortedFiles = append(sortedFiles, file.Name())
-				}
-			}
+			processFiles = append(processFiles, file.Name())
 		}
 	}
-	// Sort files for consistent processing order
-	sort.Strings(sortedFiles)
-	// Process all images from the selected pages
-	processFiles := sortedFiles
+	sort.Strings(processFiles)
 
-	// Process each selected image file and collect barcodes
+	// Process each image file and collect barcodes
 	var foundBarcodes []string
-	for i, fileName := range processFiles {
+	log.Printf("[ID:%d] Processing %d extracted images", messageBody.BarcodeScanLogID, len(processFiles))
+
+	for _, fileName := range processFiles {
 		imgPath := filepath.Join(tmpDir, fileName)
 		imgFile, err := os.Open(imgPath)
 		if err != nil {
-			log.Printf("Error opening image %s: %v", fileName, err)
+			log.Printf("[ID:%d] Error opening image %s: %v", messageBody.BarcodeScanLogID, fileName, err)
 			continue
 		}
 
 		img, _, err := image.Decode(imgFile)
 		imgFile.Close()
 		if err != nil {
-			log.Printf("Error decoding image %s: %v", fileName, err)
+			log.Printf("[ID:%d] Error decoding image %s: %v", messageBody.BarcodeScanLogID, fileName, err)
 			continue
 		}
 
-		log.Printf("Processing image %d: %s (dimensions: %dx%d)", i+1, fileName, img.Bounds().Dx(), img.Bounds().Dy())
-		// Try to detect barcode
-		barcode, err := extractBarcodeFromImage(img)
-		if err != nil {
-			log.Printf("Failed to extract barcode from image %s: %v", fileName, err)
-			// Don't continue, try next image
-		} else if barcode != "" {
-			log.Printf("Found barcode in image %s: %s", fileName, barcode)
+		if barcode, err := extractBarcodeFromImage(img); err == nil && barcode != "" {
 			foundBarcodes = append(foundBarcodes, barcode)
-			data := BarcodeData{
-				S3Key:        key,
-				BarcodeArray: []string{barcode},
-			}
-			if err := callRubyEndpoint(data); err != nil {
-				log.Printf("Error sending barcode data to API: %v", err)
-			}
 		}
 	}
 
-	// Process all found barcodes
-	if len(foundBarcodes) > 0 {
-		// Send all found barcodes in a single webhook call
-		data := BarcodeData{
-			S3Key:        key,
-			BarcodeArray: foundBarcodes,
-		}
-		if err := callRubyEndpoint(data); err != nil {
-			log.Printf("Error sending barcode data to API: %v", err)
-		}
+	// Log results
+	duration := time.Since(startTime)
+	log.Printf("[ID:%d] Processing completed in %v", messageBody.BarcodeScanLogID, duration)
+	log.Printf("[ID:%d] Found %d barcodes: %v", messageBody.BarcodeScanLogID, len(foundBarcodes), foundBarcodes)
 
-		// Return success response with found barcodes
-		jsonBody, _ := json.Marshal(ResponseBody{
-			Bucket:   bucket,
-			Key:      key,
-			Barcodes: foundBarcodes,
-		})
-		return Response{
-			StatusCode: 200,
-			Body:       string(jsonBody),
-		}, nil
-	}
-
-	// Call webhook with empty barcode array if no barcodes found
+	// Send results
 	data := BarcodeData{
-		S3Key:        key,
-		BarcodeArray: []string{},
-	}
-	if err := callRubyEndpoint(data); err != nil {
-		log.Printf("Error sending empty barcode data to API: %v", err)
+		BarcodeScanLogID: messageBody.BarcodeScanLogID,
+		BarcodeArray:     foundBarcodes,
 	}
 
-	// Return success response with empty barcode array
+	payloadJSON, _ := json.Marshal(data)
+	log.Printf("[ID:%d] Sending callback payload: %s", messageBody.BarcodeScanLogID, string(payloadJSON))
+
+	if err := callRubyEndpoint(data); err != nil {
+		log.Printf("[ID:%d] Error sending callback: %v", messageBody.BarcodeScanLogID, err)
+	} else {
+		log.Printf("[ID:%d] Successfully sent callback", messageBody.BarcodeScanLogID)
+	}
+
+	// Return response
 	jsonBody, _ := json.Marshal(ResponseBody{
 		Bucket:   bucket,
 		Key:      key,
-		Barcodes: []string{},
+		Barcodes: foundBarcodes,
 	})
 	return Response{
 		StatusCode: 200,
